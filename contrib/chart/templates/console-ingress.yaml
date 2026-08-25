@@ -32,6 +32,15 @@ spec:
       {{- end }}
       http:
         paths:
+{{- if .Values.slackbotv2.enabled }}
+          - path: /api/webhooks/slack
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "centaur.componentName" (dict "root" . "component" "slackbotv2") }}
+                port:
+                  number: 3001
+{{- end }}
           - path: /
             pathType: Prefix
             backend:
