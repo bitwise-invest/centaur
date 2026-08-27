@@ -6698,6 +6698,15 @@ fn is_transient_steering_startup_error(error: &SessionRuntimeError) -> bool {
 
 fn harness_thread_id_from_output_line(line: &str) -> Option<String> {
     let value: Value = serde_json::from_str(line).ok()?;
+    if value.get("method").and_then(Value::as_str) == Some("thread/started") {
+        return value
+            .pointer("/params/thread/id")
+            .or_else(|| value.pointer("/params/threadId"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|thread_id| !thread_id.is_empty())
+            .map(ToOwned::to_owned);
+    }
     let event_type = value.get("type").and_then(Value::as_str);
     if event_type == Some("run.started") {
         return value
@@ -7902,6 +7911,12 @@ mod tests {
                 r#"{"type":"thread.started","threadId":"codex-thread-2"}"#
             ),
             Some("codex-thread-2".to_owned())
+        );
+        assert_eq!(
+            harness_thread_id_from_output_line(
+                r#"{"method":"thread/started","params":{"thread":{"id":"codex-thread-3"}}}"#
+            ),
+            Some("codex-thread-3".to_owned())
         );
         assert_eq!(
             harness_thread_id_from_output_line(r#"{"type":"turn.started","turn_id":"turn-1"}"#),
