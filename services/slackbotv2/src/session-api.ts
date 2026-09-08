@@ -496,6 +496,7 @@ export async function forwardToSessionApi(
     harness_type: created.harnessType,
     harness_switched: created.harnessSwitched,
     persona_id: created.personaId,
+    unavailable_requested_persona_id: created.unavailableRequestedPersonaId,
     phase_ms: elapsedMs(createStartedAtMs)
   })
   await callbacks.onSessionCreated?.(created)
@@ -687,7 +688,7 @@ export async function serializeAttachment(
     const data = attachment.data ?? (await fetchAttachmentData(attachment, options))
     if (data) {
       // Re-check the actual byte count: Slack size metadata can be absent.
-      const byteLength = Buffer.isBuffer(data) ? data.length : data.size
+      const byteLength = data instanceof Blob ? data.size : data.byteLength
       if (byteLength > MAX_INLINE_ATTACHMENT_BYTES) {
         serialized.fetchError = attachmentTooLargeError(byteLength)
         return serialized
@@ -704,7 +705,7 @@ export async function serializeAttachment(
 async function fetchAttachmentData(
   attachment: Attachment,
   options?: SlackbotV2Options
-): Promise<Buffer | Blob | undefined> {
+): Promise<Buffer | Blob | ArrayBuffer | undefined> {
   if (!attachment.fetchData) return undefined
   if (!options) return attachment.fetchData()
   return withSlackApiTimeout(options, 'fetch Slack attachment', () =>
@@ -716,9 +717,9 @@ function attachmentTooLargeError(bytes: number): string {
   return `attachment too large to inline (${bytes} bytes > ${MAX_INLINE_ATTACHMENT_BYTES} byte limit)`
 }
 
-async function bytesToBase64(data: Buffer | Blob): Promise<string> {
+async function bytesToBase64(data: Buffer | Blob | ArrayBuffer): Promise<string> {
   if (Buffer.isBuffer(data)) return data.toString('base64')
-  const bytes = await data.arrayBuffer()
+  const bytes = data instanceof ArrayBuffer ? data : await data.arrayBuffer()
   return Buffer.from(bytes).toString('base64')
 }
 
@@ -769,6 +770,8 @@ type CreateSessionOutcome = {
   harnessAssignment?: SlackbotV2HarnessAssignment
   /** The persona persisted by the API. Null means the session has no persona. */
   personaId?: string | null
+  /** The unavailable persona ID replaced by the API during new-session creation. */
+  unavailableRequestedPersonaId?: string
   /** The API restarted the thread onto the requested harness. */
   harnessSwitched: boolean
 }
@@ -884,23 +887,29 @@ async function sessionOutcomeFromResponse(
 ): Promise<CreateSessionOutcome> {
   try {
     const payload = await response.json()
-    const harnessType = isJsonObject(payload) ? stringValue(payload.harness_type) : undefined
+    const payloadIsObject = isJsonObject(payload)
+    const harnessType = rawSlackString(payload, 'harness_type')
     const resolvedAssignment =
       harnessAssignment &&
       (!harnessType || harnessType === 'codex' || harnessType === 'nanocodex')
         ? { ...harnessAssignment, cohort: harnessType ?? harnessAssignment.cohort }
         : undefined
-    const personaId = isJsonObject(payload)
+    const personaId = payloadIsObject
       ? typeof payload.persona_id === 'string'
         ? payload.persona_id
         : 'persona_id' in payload
           ? null
           : undefined
       : undefined
+    const unavailableRequestedPersonaId = rawSlackString(
+      payload,
+      'unavailable_requested_persona_id'
+    )
     return {
-      harnessSwitched: isJsonObject(payload) && payload.harness_switched === true,
+      harnessSwitched: payloadIsObject && payload.harness_switched === true,
       ...(harnessType ? { harnessType } : {}),
       ...(personaId !== undefined ? { personaId } : {}),
+      ...(unavailableRequestedPersonaId ? { unavailableRequestedPersonaId } : {}),
       ...(resolvedAssignment ? { harnessAssignment: resolvedAssignment } : {})
     }
   } catch {

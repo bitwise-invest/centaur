@@ -59,6 +59,7 @@ import {
   defaultModelForHarness,
   defaultServiceTierForHarness,
   effectiveReasoningForHarness,
+  personaFallbackNotice,
   reasoningForModel,
   type SlackContextBlock
 } from './console-session-link'
@@ -162,7 +163,7 @@ const RENDER_RECOVERY_MAX_THREAD_FAILURES = 5
 const RENDER_RETRY_INITIAL_DELAY_MS = 250
 const RENDER_RETRY_MAX_DELAY_MS = 5_000
 const ASSISTANT_STATUS_MAX_CHARS = 50
-const SLACK_TASK_DETAILS_MAX_CHARS = 500
+const SLACK_TASK_DETAILS_MAX_CHARS = 256
 const SLACK_FALLBACK_TEXT_MAX_CHARS = 35_000
 const POSTGRES_CONNECT_INITIAL_DELAY_MS = 250
 const POSTGRES_CONNECT_MAX_DELAY_MS = 10_000
@@ -306,6 +307,7 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
     botToken: options.botToken,
     botUserId: options.botUserId,
     signingSecret: options.signingSecret,
+    streamSegmentMaxAgeMs: Number(process.env.SLACK_STREAM_SEGMENT_MAX_AGE_MS) || undefined,
     userName,
     logger
   })
@@ -1228,20 +1230,6 @@ async function syncThreadMessageToSession(
   const includeResponseMetadata =
     responseMetadataMode === 'always' ||
     (responseMetadataMode === 'first' && isFirstAssistantMessage)
-  let responseContextBlock = isFirstAssistantMessage || includeResponseMetadata
-    ? buildSlackResponseContextBlock({
-        consoleBaseUrl: isFirstAssistantMessage ? input.options.consolePublicUrl : undefined,
-        threadKey: thread.id,
-        harnessType: effectiveHarnessType,
-        metadataEnabled: includeResponseMetadata,
-        model: effectiveModel,
-        reasoning: effectiveReasoning,
-        serviceTier:
-          input.options.responseServiceTierEnabled === true && !resolvedProvider
-            ? defaultServiceTierForHarness(effectiveHarnessType)
-            : undefined
-      })
-    : undefined
   if (
     overrides.harnessType ||
     overrides.model ||
@@ -1472,6 +1460,7 @@ async function syncThreadMessageToSession(
     return
   }
 
+  let responseContextBlock: SlackContextBlock | undefined
   try {
     await thread.setState({ activeExecution: true })
     traceLog(input.options, 'slackbotv2_forward_active_execution_marked', trace)
@@ -1479,8 +1468,12 @@ async function syncThreadMessageToSession(
       onExecutionStarted: commitExecutionStarted,
       onMessagesAppended: commitMessagesAppended,
       onSessionCreated: async outcome => {
+        const fallbackNotice = personaFallbackNotice(
+          outcome.unavailableRequestedPersonaId,
+          outcome.personaId
+        )
         if (outcome.personaId !== undefined) {
-          const requestedPersonaId = stickyOverridesUpdate?.personaId
+          const requestedPersonaId = forwardInput.personaId
           stickyOverridesUpdate = {
             ...(stickyOverridesUpdate ?? {}),
             personaId: outcome.personaId
@@ -1489,7 +1482,8 @@ async function syncThreadMessageToSession(
           if (requestedPersonaId !== undefined && outcome.personaId !== requestedPersonaId) {
             traceLog(input.options, 'slackbotv2_session_persona_reconciled', trace, {
               requested_persona_id: requestedPersonaId,
-              resolved_persona_id: outcome.personaId
+              resolved_persona_id: outcome.personaId,
+              unavailable_requested_persona_id: outcome.unavailableRequestedPersonaId
             })
           }
         }
@@ -1497,37 +1491,39 @@ async function syncThreadMessageToSession(
         const abTested = outcome.harnessAssignment?.experiment === 'codex_nanocodex_ab'
         forwardInput.metadataHarnessType = harnessType
         forwardInput.harnessAssignment = outcome.harnessAssignment
-        if (harnessType === effectiveHarnessType && !abTested) return
-        const model =
-          resolvedModel ?? defaultModelForHarness(harnessType, input.options.harnessDefaultModels)
-        const requestedReasoning = reasoningForModel(harnessType, model, resolvedReasoning)
-        const reasoning = effectiveReasoningForHarness(
-          harnessType,
-          requestedReasoning,
-          input.options.harnessDefaultReasoning
-        )
-        forwardInput.metadataModel = model
-        forwardInput.reasoning = requestedReasoning
-        if (isFirstAssistantMessage || includeResponseMetadata) {
-          responseContextBlock = buildSlackResponseContextBlock({
-            consoleBaseUrl: isFirstAssistantMessage ? input.options.consolePublicUrl : undefined,
-            threadKey: thread.id,
+        let model = effectiveModel
+        let reasoning = effectiveReasoning
+        if (harnessType !== effectiveHarnessType || abTested) {
+          model =
+            resolvedModel ?? defaultModelForHarness(harnessType, input.options.harnessDefaultModels)
+          const requestedReasoning = reasoningForModel(harnessType, model, resolvedReasoning)
+          reasoning = effectiveReasoningForHarness(
             harnessType,
-            metadataEnabled: includeResponseMetadata,
-            model,
-            reasoning,
-            serviceTier:
-              input.options.responseServiceTierEnabled === true && !resolvedProvider
-                ? defaultServiceTierForHarness(harnessType)
-                : undefined
+            requestedReasoning,
+            input.options.harnessDefaultReasoning
+          )
+          forwardInput.metadataModel = model
+          forwardInput.reasoning = requestedReasoning
+          traceLog(input.options, 'slackbotv2_session_harness_resolved', trace, {
+            ab_tested: abTested,
+            ab_test_experiment: outcome.harnessAssignment?.experiment,
+            ab_test_cohort: outcome.harnessAssignment?.cohort,
+            requested_harness_type: effectiveHarnessType,
+            resolved_harness_type: harnessType
           })
         }
-        traceLog(input.options, 'slackbotv2_session_harness_resolved', trace, {
-          ab_tested: abTested,
-          ab_test_experiment: outcome.harnessAssignment?.experiment,
-          ab_test_cohort: outcome.harnessAssignment?.cohort,
-          requested_harness_type: effectiveHarnessType,
-          resolved_harness_type: harnessType
+        responseContextBlock = buildSlackResponseContextBlock({
+          consoleBaseUrl: isFirstAssistantMessage ? input.options.consolePublicUrl : undefined,
+          threadKey: thread.id,
+          harnessType,
+          metadataEnabled: includeResponseMetadata,
+          model,
+          notice: fallbackNotice,
+          reasoning,
+          serviceTier:
+            input.options.responseServiceTierEnabled === true && !resolvedProvider
+              ? defaultServiceTierForHarness(harnessType)
+              : undefined
         })
       },
       onSessionRestarted: handleSessionRestarted
@@ -2823,7 +2819,10 @@ function truncateSlackText(value: string, maxChars: number, label: string): stri
   let omitted = value.length - maxChars
   while (true) {
     const suffix = `\n[truncated ${omitted} chars from ${label}]`
-    const keep = Math.max(0, maxChars - suffix.length)
+    let keep = Math.max(0, maxChars - suffix.length)
+    // Keep a Unicode surrogate pair together at the truncation boundary.
+    const lastCode = value.charCodeAt(keep - 1)
+    if (lastCode >= 0xd800 && lastCode <= 0xdbff) keep -= 1
     const actualOmitted = value.length - keep
     if (actualOmitted === omitted) return `${value.slice(0, keep).trimEnd()}${suffix}`
     omitted = actualOmitted
