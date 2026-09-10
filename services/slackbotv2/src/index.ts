@@ -52,6 +52,7 @@ import {
   serializeMessage,
   sessionStreamError,
   slackApiTimeoutMs,
+  WORKFLOW_ACTION_PREFIX,
   withSlackApiTimeout
 } from './session-api'
 import {
@@ -143,6 +144,7 @@ const MAX_SLACK_MESSAGE_ATTACHMENTS = 20
 
 type SlackbotV2RequestContext = {
   waitUntil(promise: Promise<unknown>): void
+  actionError?: unknown
 }
 
 type StateConnectionStatus = {
@@ -303,6 +305,9 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
   const userName = options.userName ?? 'centaur'
   const logger = options.logger ?? noopLogger
   const slack = createSlackAdapter({
+    agentView: options.agentViewEnabled === true,
+    // Titles come from durable session events, including recovery.
+    sessionTitle: false,
     apiUrl: options.slackApiUrl,
     botToken: options.botToken,
     botUserId: options.botUserId,
@@ -327,7 +332,10 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
 
   chat.onAction(async event => {
     const payload = slackBlockActionPayload(event)
-    const dedupeKey = slackBlockActionDedupeKey(payload)
+    const workflowAction = payload.action_id.startsWith(WORKFLOW_ACTION_PREFIX)
+    // Workflow starts deduplicate durably using the Slack click identity.
+    // A temporary ingress lease must never acknowledge a lost click.
+    const dedupeKey = workflowAction ? undefined : slackBlockActionDedupeKey(payload)
     const leaseToken = randomUUID()
     if (
       dedupeKey
@@ -343,8 +351,33 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
       return
     }
     try {
-      await dispatchSlackBlockAction(options, payload)
+      const result = await dispatchSlackBlockAction(options, payload)
+      // The workflow owns the message and its final button state. Successful
+      // handoff (including redelivery) only needs Slack's native acknowledgment;
+      // a separate success message adds noise before the actual result arrives.
+      if (result?.outcome === 'unavailable' && payload.channel_id) {
+        backgroundWaitUntil(
+          withSlackApiTimeout(options, 'post workflow action feedback', () =>
+            callSlackApi('chat.postEphemeral', {
+              channel: payload.channel_id,
+              user: payload.user_id,
+              ...(payload.thread_ts ? { thread_ts: payload.thread_ts } : {}),
+              text: 'This request is no longer available.'
+            }, {
+              apiUrl: options.slackApiUrl,
+              fetch: options.fetch as typeof globalThis.fetch | undefined,
+              token: options.botToken
+            })
+          ).catch(error => {
+            traceWarn(options, 'slackbotv2_action_feedback_failed', undefined, {
+              error: errorMessage(error)
+            })
+          })
+        )
+      }
     } catch (error) {
+      const context = requestContext.getStore()
+      if (workflowAction && context) context.actionError = error
       try {
         if (dedupeKey && (await state.get(dedupeKey)) === leaseToken) {
           await state.delete(dedupeKey)
@@ -383,9 +416,46 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
       message_ts: payload.message_ts,
       team_id: payload.team_id,
       thread_ts: payload.thread_ts,
-      workflow_event_name: `slack.block_action.${payload.action_id}`
+      workflow_event_name: workflowAction ? undefined : `slack.block_action.${payload.action_id}`
     })
   })
+
+  if (options.agentViewEnabled) {
+    chat.onDirectMessage(async (_thread, message) => {
+      if (!(await isAllowedSlackMessage(message, options, logger))) return
+      const raw = isJsonObject(message.raw) ? message.raw : {}
+      const channel = stringValue(raw.channel)
+      const threadTs = stringValue(raw.thread_ts) ?? stringValue(raw.ts)
+      if (!channel || !threadTs) return
+      // Legacy DMs leave a conversation-wide subscription behind. The SDK
+      // preserves that routing for proactive bots; our agent sessions always
+      // follow Slack's thread roots, including after toggling modes.
+      const threadId = slack.encodeThreadId({ channel, threadTs })
+      const thread = chat.thread(threadId)
+      const directMessage = new ChatSdkMessage({
+        attachments: message.attachments,
+        author: message.author,
+        formatted: message.formatted,
+        id: message.id,
+        isMention: true,
+        links: message.links,
+        metadata: message.metadata,
+        raw: message.raw,
+        text: message.text,
+        threadId
+      })
+      lateSlackFiles.rememberFilelessMention(thread, directMessage)
+      await handleSlackMessageHandoff(thread, directMessage, {
+        assistantStatusRequested: true,
+        mode: 'execute',
+        options,
+        state,
+        steeringReactions,
+        subscribe: true,
+        trigger: 'direct_message'
+      })
+    })
+  }
 
   chat.onNewMention(async (thread, message) => {
     if (!(await isAllowedSlackMessage(message, options, logger))) return
@@ -470,7 +540,13 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
         outcome = 'ignored'
         return new globalThis.Response('ok', { status: 200 })
       }
-      const awaitHandoff = shouldAwaitSlackHandoff(rawBody)
+      const interaction = parseSlackWebhookPayload(rawBody)
+      const workflowAction = interaction?.type === 'block_actions'
+        && Array.isArray(interaction.actions)
+        && interaction.actions.some(action => isJsonObject(action)
+          && typeof action.action_id === 'string'
+          && action.action_id.startsWith(WORKFLOW_ACTION_PREFIX))
+      const awaitHandoff = workflowAction || shouldAwaitSlackHandoff(rawBody)
       const handoffTasks: Promise<unknown>[] = []
       const context: SlackbotV2RequestContext = {
         waitUntil: promise => waitUntil(c, promise)
@@ -517,6 +593,10 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
             error: waitError ? errorMessage(waitError) : undefined,
             phase_ms: elapsedMs(waitStartedAtMs)
           })
+        }
+        if (workflowAction && (waitError || context.actionError)) {
+          outcome = 'error'
+          return new globalThis.Response('Workflow action could not be recorded. Please retry.', { status: 503 })
         }
       }
       const lateFileTask = lateSlackFiles.repairFromWebhook(rawBody)
@@ -818,6 +898,9 @@ function slackBlockActionPayload(event: ActionEvent): SlackbotV2BlockActionPaylo
   const messageTs = stringValue(message.ts) ?? stringValue(container.message_ts)
   const messageId = event.messageId.startsWith('ephemeral:') ? (messageTs ?? '') : event.messageId
   return removeUndefinedValues({
+    ...(event.actionId.startsWith(WORKFLOW_ACTION_PREFIX) && Array.isArray(message.blocks)
+      ? { workflow_message: { text: stringValue(message.text) ?? '', blocks: message.blocks } }
+      : {}),
     action_id: event.actionId,
     action_ts: stringValue(rawAction.action_ts),
     block_id: stringValue(rawAction.block_id),
@@ -2595,7 +2678,7 @@ async function renderExecutionStream(
       // chat.stopStream. The Console link is only included on the first assistant
       // message; optional response metadata may be appended on every live response.
       ...(responseContextBlock ? { stopBlocks: [responseContextBlock] } : {})
-    })
+    }) ?? await thread.post(visibleStream)
     return { diverged: capture.diverged, messageId: sent?.id }
   } finally {
     await setAssistantStatus(thread, '', options, trace)
@@ -2645,7 +2728,7 @@ async function renderRecoveredExecutionStream(
         recipientUserId: message.author.userId,
         ...(taskDisplayMode === 'none' ? {} : { taskDisplayMode })
       }
-    )
+    ) ?? await thread.post(visibleStream)
     return { diverged: capture.diverged, messageId: sent?.id }
   } finally {
     await setAssistantStatus(thread, '', options, trace)

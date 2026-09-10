@@ -352,9 +352,12 @@
       "type": "object",
       "properties": {
         "syncInfraSecrets": { "type": "boolean" },
+        "mcpV2Enabled": { "type": "boolean" },
         "mcpPublicUrl": { "type": "string" },
         "sandboxRunningLimit": { "type": "integer", "minimum": 0 },
         "sandboxHotIdleGraceSecs": { "type": "integer", "minimum": 0 },
+        "sessionEventsRetentionDays": { "type": "integer", "minimum": 0, "maximum": 3650 },
+        "sessionEventsRetentionSweepIntervalSecs": { "type": "integer", "minimum": 1 },
         "sandboxOrphanSweepGraceSecs": { "type": "integer", "minimum": 1 },
         "workflowHostSandbox": { "type": "boolean" },
         "workflowHostResources": { "type": "object" },
@@ -464,6 +467,7 @@
     "slackbotv2": {
       "type": "object",
       "properties": {
+        "agentViewEnabled": { "type": "boolean" },
         "mcpPublicUrl": { "type": "string" },
         "codexNanocodexRolloutPercent": {
           "type": "integer",

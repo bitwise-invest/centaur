@@ -78,6 +78,9 @@ beforeAll(async () => {
             'channels:join',
             'channels:read',
             'chat:write',
+            'im:read',
+            'im:write',
+            'im:history',
             'users:read'
           ]
         },
@@ -125,6 +128,61 @@ afterAll(async () => {
 })
 
 describe('slackbotv2', () => {
+  for (const agentViewEnabled of [false, true]) {
+    it(`routes DM roots and replies with agent view ${agentViewEnabled}`, async () => {
+      bot = createTestBot({ agentViewEnabled })
+      const members = await slackBot.users.list({})
+      const userId = members.members?.find(member => member.name === 'tester')?.id
+      expect(userId).toBeDefined()
+      const dm = await slackBot.conversations.open({ users: userId! })
+      expect(dm.channel?.id).toBeDefined()
+      const channel = dm.channel!.id!
+      // A prior legacy DM leaves this subscription behind when the toggle is
+      // enabled. Agent mode must still use the new user message as its root.
+      if (agentViewEnabled) await bot.chat.getState().subscribe(`slack:${channel}:`)
+      const roots: string[] = []
+      for (let turn = 0; turn < 2; turn++) {
+        const posted = await slackBot.chat.postMessage({ channel, text: `DM request ${turn}` })
+        expect(posted.ts).toBeDefined()
+        roots.push(posted.ts!)
+        const waits: Promise<unknown>[] = []
+        const response = await bot.app.request('/api/webhooks/slack', signedSlackEvent({
+          event_id: `Ev-agent-dm-${turn}`,
+          event: {
+            type: 'message', channel_type: 'im', channel, user: USER_ID,
+            ts: posted.ts, text: `DM request ${turn}`
+          }
+        }), {}, waitUntilContext(waits))
+        expect(response.status).toBe(200)
+        await Promise.all(waits)
+        const delivered = agentViewEnabled
+          ? await slackBot.conversations.replies({ channel, ts: posted.ts! })
+          : await slackBot.conversations.history({ channel })
+        const answerText = (delivered.messages ?? [])
+          .map(message => [message.text ?? '', blocksText(message.blocks)].join('\n'))
+          .join('\n')
+        expect(answerText).toContain(`Executed request ${turn + 1}.`)
+      }
+      expect(codexApi.executes.map(request => request.threadKey)).toEqual(
+        roots.map(ts => `slack:${channel}:${agentViewEnabled ? ts : ''}`)
+      )
+      const reply = await slackBot.chat.postMessage({ channel, thread_ts: roots[0], text: 'Follow up' })
+      const waits: Promise<unknown>[] = []
+      const response = await bot.app.request('/api/webhooks/slack', signedSlackEvent({
+        event_id: 'Ev-agent-dm-reply',
+        event: {
+          type: 'message', channel_type: 'im', channel, user: USER_ID,
+          ts: reply.ts, thread_ts: roots[0], text: 'Follow up'
+        }
+      }), {}, waitUntilContext(waits))
+      expect(response.status).toBe(200)
+      await Promise.all(waits)
+      expect(codexApi.executes.at(-1)?.threadKey).toBe(`slack:${channel}:${roots[0]}`)
+      expect(slackApi.calls.some(call => call.method === 'chat.stopStream')).toBe(true)
+      expect(slackApi.calls.some(call => call.method === 'agents.sessions.rename')).toBe(agentViewEnabled)
+    })
+  }
+
   it('accepts Slack events on the legacy route', async () => {
     const parent = await postUserMessage('Legacy route context.')
     const mention = await postUserMessage(`<@${BOT_USER_ID}> use the legacy route`, parent.ts)
@@ -376,6 +434,115 @@ describe('slackbotv2', () => {
     )
     expect(JSON.stringify(codexApi.workflowEvents)).not.toContain('response_url')
     expect(JSON.stringify(codexApi.workflowEvents)).not.toContain('sensitive-response-token')
+  })
+
+  it('durably hands off workflow buttons before acknowledging and retries failed acceptance', async () => {
+    const requests: Record<string, unknown>[] = []
+    const feedback: unknown[] = []
+    let release: (() => void) | undefined
+    const held = new Promise<void>(resolve => { release = resolve })
+    let fail = true
+    let created = true
+    bot = createTestBot({
+      fetch: async (input, init) => {
+        if (String(input).endsWith('/api/workflows/actions/invoke')) {
+          requests.push(JSON.parse(String(init?.body)))
+          await held
+          return fail
+            ? Response.json({ error: 'temporarily unavailable' }, { status: 503 })
+            : Response.json({ ok: true, run_id: 'run-click-1', task_id: 'task-click-1', created, status: 'queued' })
+        }
+        if (String(input).endsWith('/chat.postEphemeral')) {
+          feedback.push(Object.fromEntries(new URLSearchParams(String(init?.body))))
+        }
+        return globalThis.fetch(input, init)
+      }
+    })
+    const payload = {
+      type: 'block_actions', team: { id: TEAM_ID },
+      user: { id: USER_ID, username: 'tester', team_id: TEAM_ID },
+      channel: { id: CHANNEL_ID }, message: {
+        ts: '1700000003.000200', text: 'Approve this release?',
+        blocks: [
+          { type: 'section', text: { type: 'mrkdwn', text: 'Approve this release?' } },
+          { type: 'actions', elements: [{ type: 'button', text: { type: 'plain_text', text: 'Approve' },
+            action_id: 'centaur.workflow.action:00000000-0000-0000-0000-000000000001:approve',
+            value: 'v1.opaque-signed-payload.signature' }] }
+        ]
+      },
+      actions: [{
+        action_id: 'centaur.workflow.action:00000000-0000-0000-0000-000000000001:approve',
+        action_ts: '1700000004.000200', type: 'button',
+        value: 'v1.opaque-signed-payload.signature'
+      }]
+    }
+    const waits: Promise<unknown>[] = []
+    let acknowledged = false
+    const first = Promise.resolve(bot.app.request('/api/slack/actions', signedSlackInteraction(payload), {}, waitUntilContext(waits)))
+      .then(response => { acknowledged = true; return response })
+    await waitFor(() => requests.length === 1)
+    expect(acknowledged).toBe(false)
+    release?.()
+    expect((await first).status).toBe(503)
+    fail = false
+    const retry = await bot.app.request('/api/slack/actions', signedSlackInteraction(payload), {}, waitUntilContext(waits))
+    expect(retry.status).toBe(200)
+    expect(await retry.text()).toBe('')
+    created = false
+    const duplicate = await bot.app.request('/api/slack/actions', signedSlackInteraction(payload), {}, waitUntilContext(waits))
+    expect(duplicate.status).toBe(200)
+    expect(await duplicate.text()).toBe('')
+    await Promise.all(waits)
+    expect(feedback).toEqual([])
+    expect(requests).toHaveLength(3)
+    expect(requests[0]).toEqual({
+      button: payload.actions[0]?.value,
+      message: { text: payload.message.text, blocks: payload.message.blocks },
+      idempotency_key: expect.stringMatching(/^slack\.button:[0-9a-f]{64}$/),
+      click: {
+          id: '00000000-0000-0000-0000-000000000001', action: 'approve',
+          action_ts: payload.actions[0]?.action_ts, channel_id: CHANNEL_ID,
+          message_ts: payload.message.ts, team_id: TEAM_ID, user_id: USER_ID
+      }
+    })
+    expect(requests[1]).toEqual(requests[0])
+    expect(requests[2]).toEqual(requests[0])
+    expect(codexApi.workflowEvents).toHaveLength(0)
+  })
+
+  it('acknowledges a permanently rejected workflow button without retrying it', async () => {
+    let starts = 0
+    const feedback: unknown[] = []
+    bot = createTestBot({
+      fetch: async (input, init) => {
+        if (String(input).endsWith('/api/workflows/actions/invoke')) {
+          starts += 1
+          expect(JSON.parse(String(init?.body)).button).toBe('unsigned')
+          return Response.json({ error: 'invalid or untrusted workflow button' }, { status: 403 })
+        }
+        if (String(input).endsWith('/chat.postEphemeral')) {
+          feedback.push(Object.fromEntries(new URLSearchParams(String(init?.body))))
+          return Response.json({ ok: true })
+        }
+        return globalThis.fetch(input, init)
+      }
+    })
+    const payload = {
+      type: 'block_actions', team: { id: TEAM_ID },
+      user: { id: USER_ID, username: 'tester', team_id: TEAM_ID },
+      channel: { id: CHANNEL_ID }, message: { ts: '1700000003.000200', thread_ts: '1700000003.000100' },
+      actions: [{ type: 'button', action_id: 'centaur.workflow.action:00000000-0000-0000-0000-000000000001:approve',
+        action_ts: '1700000004.000200', value: 'unsigned' }]
+    }
+    const waits: Promise<unknown>[] = []
+    const response = await bot.app.request('/api/slack/actions', signedSlackInteraction(payload), {}, waitUntilContext(waits))
+    expect(response.status).toBe(200)
+    await Promise.all(waits)
+    expect(starts).toBe(1)
+    expect(feedback).toEqual([{
+      channel: CHANNEL_ID, user: USER_ID, thread_ts: '1700000003.000100',
+      text: 'This request is no longer available.'
+    }])
   })
 
   it('applies the external-org allowlist to Slack block actions', async () => {
@@ -6500,6 +6667,8 @@ type PatchedSlackApi = {
 type StreamCall = {
   body: Record<string, unknown>
   method:
+    | 'agents.sessions.setStatus'
+    | 'agents.sessions.rename'
     | 'assistant.threads.setStatus'
     | 'assistant.threads.setTitle'
     | 'chat.startStream'
@@ -6698,6 +6867,12 @@ async function handlePatchedSlackRequest(
   }
 
   const path = normalizeApiPath(url.pathname)
+  if (path === '/api/agents.sessions.setStatus' || path === '/api/agents.sessions.rename') {
+    const body = await requestBody(request)
+    input.calls.push({ method: path.slice('/api/'.length) as StreamCall['method'], body })
+    await sendWebResponse(res, Response.json({ ok: true }))
+    return
+  }
   if (path === '/api/assistant.threads.setStatus') {
     const body = await requestBody(request)
     input.calls.push({ method: 'assistant.threads.setStatus', body })
