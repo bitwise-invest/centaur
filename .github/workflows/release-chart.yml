@@ -47,7 +47,7 @@ jobs:
             git switch --orphan gh-pages
             git commit --allow-empty -m "chore: initialize gh-pages"
             git push origin gh-pages
-            git switch -
+            git switch --detach "$GITHUB_SHA"
           fi
 
       - name: Set up Helm
