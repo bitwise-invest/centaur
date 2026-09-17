@@ -7,9 +7,9 @@ and the bot answers *in the thread* with a comment. It's built on the official
 the session logic (`session-api.ts`) and rendering are the same as the other bots; the Rust `api-rs`
 control plane is unchanged (`github:…` thread keys flow through identically).
 
-The bot acts as a **real GitHub teammate**: it authenticates with a personal access token on a
-dedicated machine-user account, so it can be `@`-mentioned, assigned, and **requested as a
-reviewer** like any other collaborator.
+The bot can authenticate as a GitHub App or as a real GitHub teammate using a personal access
+token. The teammate mode can be assigned and requested as a reviewer like any other collaborator;
+the App mode is intended for webhook- and mention-driven automation.
 
 ## Behavior
 
@@ -132,17 +132,19 @@ sandbox. Both assume the **single replica** the chart runs (`replicaCount: 1`).
 
 ## Auth
 
-A personal access token for the bot's GitHub teammate account is required (`GITHUB_TOKEN`). As a
-normal user account it is natively mentionable, assignable, and requestable as a reviewer, and the
-token inherits that user's permissions. Scopes: **`repo`** (read PRs/issues, post and edit comments,
-add reactions) — and, when the agent pushes branches or opens PRs from its sandbox, **`workflow`**.
+A personal access token for the bot's GitHub teammate account (`GITHUB_TOKEN`) or GitHub App
+credentials (`GITHUB_APP_ID` and `GITHUB_PRIVATE_KEY`) are required. For a single-tenant App, set
+`GITHUB_INSTALLATION_ID`. Centaur's lifecycle handlers require a fixed installation, and the adapter
+refreshes its installation tokens automatically.
 
-Keep this distinct from the `GITHUB_TOKEN` used by the repo-cache / sandbox tooling — that one is the
-agent's git-operations token; this one is the bot's own identity. The chart wires githubbot's token
-from a separate `GITHUBBOT_TOKEN` secret key to avoid collision.
+The PAT mode acts as a normal user account and is natively assignable and requestable as a reviewer.
+Scopes: **`repo`** (read PRs/issues, post and edit comments, add reactions) — and, when the agent
+pushes branches or opens PRs from its sandbox, **`workflow`**.
 
-GitHub App auth is also supported by the adapter (`GITHUB_APP_ID` / `GITHUB_PRIVATE_KEY`), but the
-PAT-teammate model is what we run.
+In PAT mode, keep this distinct from the `GITHUB_TOKEN` used by the repo-cache / sandbox tooling —
+that one is the agent's git-operations token; this one is the bot's own identity. The chart wires the
+PAT from a separate `GITHUBBOT_TOKEN` secret key. In App mode, the chart reads the private key from a
+dedicated existing Kubernetes Secret.
 
 Webhook events to subscribe: **Issue comments**, **Pull request review comments**, **Issues**, **Pull
 requests**, **Pull request reviews**, **Check runs**, **Check suites**, and **Workflow runs**
@@ -152,7 +154,10 @@ requests**, **Pull request reviews**, **Check runs**, **Check suites**, and **Wo
 
 | Var | Required | Notes |
 |-----|----------|-------|
-| `GITHUB_TOKEN` | ✅ | PAT for the bot's teammate account. |
+| `GITHUB_TOKEN` | conditional | PAT for the bot's teammate account. Mutually exclusive with GitHub App credentials. |
+| `GITHUB_APP_ID` | conditional | GitHub App ID. Required with `GITHUB_PRIVATE_KEY` when `GITHUB_TOKEN` is unset. |
+| `GITHUB_PRIVATE_KEY` | conditional | GitHub App private key in PEM format. |
+| `GITHUB_INSTALLATION_ID` | conditional | Fixed installation ID required in GitHub App mode. |
 | `GITHUB_WEBHOOK_SECRET` | ✅ | Webhook signing secret (or `GITHUBBOT_WEBHOOK_SECRET`). |
 | `GITHUB_BOT_USERNAME` | ✅ | The bot account's GitHub login — drives `@`-mention and requested-reviewer matching (or `GITHUBBOT_USER_NAME`). |
 | `GITHUBBOT_DATABASE_URL` | ✅ | Postgres for chat-SDK state (falls back to `DATABASE_URL` / `POSTGRES_URL`). |

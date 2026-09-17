@@ -156,8 +156,14 @@ export type GithubbotOptions = {
   holdLabel?: string;
   /** Merge method for auto-merge: "merge" | "squash" | "rebase". Default "squash". */
   mergeMethod?: "merge" | "squash" | "rebase";
+  /** GitHub App ID. Required with privateKey when token is unset. */
+  appId?: string;
+  /** Fixed installation ID for a single-tenant GitHub App. */
+  installationId?: number;
+  /** GitHub App private key in PEM format. Required with appId. */
+  privateKey?: string;
   /** Personal access token for the bot's GitHub teammate account. */
-  token: string;
+  token?: string;
   userName?: string;
   /**
    * GitHub `author_association` values allowed to drive the conversational

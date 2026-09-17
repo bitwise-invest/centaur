@@ -1,5 +1,9 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { createGitHubAdapter, type GitHubAdapter } from "@chat-adapter/github";
+import {
+  createGitHubAdapter,
+  type GitHubAdapter,
+  type GitHubAdapterConfig,
+} from "@chat-adapter/github";
 import { createPostgresState } from "@chat-adapter/state-pg";
 import {
   Chat,
@@ -64,17 +68,40 @@ const POSTGRES_CONNECT_INITIAL_DELAY_MS = 250;
 const POSTGRES_CONNECT_MAX_DELAY_MS = 10_000;
 const DEDUP_WINDOW = 200;
 
-export function createGithubbot(options: GithubbotOptions): Githubbot {
-  const userName = options.userName ?? "github-bot";
-  const logger = options.logger ?? noopLogger;
-  const github = createGitHubAdapter({
-    token: options.token,
+function githubAdapterConfig(
+  options: GithubbotOptions,
+  userName: string,
+  logger: NonNullable<GithubbotOptions["logger"]>,
+): GitHubAdapterConfig {
+  const commonConfig = {
     webhookSecret: options.webhookSecret,
     userName,
     ...(options.botUserId ? { botUserId: Number(options.botUserId) } : {}),
     ...(options.githubApiUrl ? { apiUrl: options.githubApiUrl } : {}),
     logger,
-  });
+  };
+  if (options.token) {
+    return { ...commonConfig, token: options.token };
+  }
+  if (options.appId && options.privateKey && options.installationId) {
+    return {
+      ...commonConfig,
+      appId: options.appId,
+      privateKey: options.privateKey,
+      installationId: options.installationId,
+    };
+  }
+  throw new Error(
+    "GitHub authentication requires GITHUB_TOKEN or GITHUB_APP_ID with GITHUB_PRIVATE_KEY and GITHUB_INSTALLATION_ID",
+  );
+}
+
+export function createGithubbot(options: GithubbotOptions): Githubbot {
+  const userName = options.userName ?? "github-bot";
+  const logger = options.logger ?? noopLogger;
+  const github = createGitHubAdapter(
+    githubAdapterConfig(options, userName, logger),
+  );
   const state = options.state ?? createDefaultState(options, logger);
   const chat = new Chat<{ github: typeof github }, GithubbotThreadState>({
     userName,

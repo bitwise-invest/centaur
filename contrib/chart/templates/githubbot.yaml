@@ -67,14 +67,23 @@ spec:
             # the deployment's default harness.
             - name: GITHUBBOT_DEFAULT_HARNESS
               value: {{ .Values.sandbox.harnessEngine | quote }}
-            # Personal access token for the bot's GitHub teammate account — kept
-            # distinct from the sandbox tool token so the bot acts as its own
-            # GitHub user (requestable as a reviewer, @-mentionable).
+{{- if eq .Values.githubbot.auth.mode "githubApp" }}
+            - name: GITHUB_APP_ID
+              value: {{ required "githubbot.auth.appId is required for GitHub App auth" .Values.githubbot.auth.appId | quote }}
+            - name: GITHUB_INSTALLATION_ID
+              value: {{ required "githubbot.auth.installationId is required for GitHub App auth" .Values.githubbot.auth.installationId | quote }}
+            - name: GITHUB_PRIVATE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "githubbot.auth.existingPrivateKeySecretName is required for GitHub App auth" .Values.githubbot.auth.existingPrivateKeySecretName }}
+                  key: {{ .Values.githubbot.auth.privateKeySecretKey }}
+{{- else }}
             - name: GITHUB_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: {{ include "centaur.secretEnvName" . }}
                   key: {{ printf "%sGITHUBBOT_TOKEN" .Values.secretManager.envPrefix }}
+{{- end }}
             # githubbot's own webhook signing secret (the GitHub repo/org webhook).
             - name: GITHUB_WEBHOOK_SECRET
               valueFrom:

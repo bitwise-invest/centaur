@@ -5,9 +5,20 @@ import { createGithubbot, type GithubbotOptions } from "./index";
 const port = numberEnv("PORT", 3001);
 const apiUrl = stringEnv("CENTAUR_API_URL", "http://127.0.0.1:8080");
 
-// Personal access token for the bot's GitHub teammate account (the bot acts as a
-// real GitHub user — it can be requested as a reviewer, @-mentioned, assigned).
-const token = requiredEnv("GITHUB_TOKEN");
+const token = optionalEnv("GITHUB_TOKEN");
+const appId = optionalEnv("GITHUB_APP_ID");
+const privateKey = optionalEnv("GITHUB_PRIVATE_KEY");
+const installationId = optionalNumberEnv("GITHUB_INSTALLATION_ID");
+if (token && (appId || privateKey || installationId)) {
+  throw new Error(
+    "Configure either GITHUB_TOKEN or GitHub App credentials, not both",
+  );
+}
+if (!token && (!appId || !privateKey || !installationId)) {
+  throw new Error(
+    "GITHUB_TOKEN or GITHUB_APP_ID with GITHUB_PRIVATE_KEY and GITHUB_INSTALLATION_ID is required",
+  );
+}
 
 // Signing secret configured on the GitHub repo/org webhook. The adapter verifies
 // comment webhooks; githubbot verifies the pull_request (review-request) webhook.
@@ -110,6 +121,7 @@ if (!postgresUrl) {
 }
 
 const options: GithubbotOptions = {
+  appId,
   apiUrl,
   allowedAuthorAssociations: listEnv("GITHUBBOT_ALLOWED_AUTHOR_ASSOCIATIONS"),
   apiKey: optionalEnv("GITHUBBOT_API_KEY"),
@@ -124,8 +136,10 @@ const options: GithubbotOptions = {
   defaultHarnessType: optionalEnv("GITHUBBOT_DEFAULT_HARNESS"),
   githubApiUrl: optionalEnv("GITHUB_API_URL"),
   idleTimeoutMs: optionalNumberEnv("SESSION_IDLE_TIMEOUT_MS"),
+  installationId,
   maxDurationMs: optionalNumberEnv("SESSION_MAX_DURATION_MS"),
   postgresUrl,
+  privateKey,
   reviewPrompt,
   issuePrompt,
   managementPrompt,
@@ -170,14 +184,6 @@ process.on("SIGINT", () => void shutdown("SIGINT"));
 function optionalEnv(name: string): string | undefined {
   const value = process.env[name]?.trim();
   return value ? value : undefined;
-}
-
-function requiredEnv(name: string): string {
-  const value = optionalEnv(name);
-  if (!value) {
-    throw new Error(`${name} is required`);
-  }
-  return value;
 }
 
 function stringEnv(name: string, fallback: string): string {
