@@ -72,7 +72,7 @@ spec:
           terminationMessagePolicy: File
           volumeMounts:
             - name: data
-              mountPath: /var/lib/postgresql
+              mountPath: /var/lib/postgresql/data
               {{- with .Values.postgres.persistence.subPath }}
               subPath: {{ . | quote }}
               {{- end }}
