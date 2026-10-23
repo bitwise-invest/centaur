@@ -1,7 +1,7 @@
 # Operator console: a lightweight, server-rendered HTML view over principals,
 # their effective grants, and secrets. Read-only; gated behind a console session
 # (ApplicationController#require_login) and restricted to admins (require_admin),
-# like every Control/Data Sync page. Distinct from the JSON API.
+# like every Control page. Distinct from the JSON API.
 class ConsoleController < ApplicationController
   include SecretKinds
   include Console::SlackChannelPermissionManagement
@@ -48,18 +48,9 @@ class ConsoleController < ApplicationController
     load_slack_channel_permission_form(@principal)
     @inherited_slack_channel_permissions = @principal.inherited_slack_channel_permissions_payload
     load_principal_roles
-    effective_grant_relations = {
-      "static" => @principal.granted_static_secrets,
-      "gcp_auth" => @principal.granted_gcp_auth_secrets,
-      "gcp_id_token" => @principal.granted_gcp_id_token_secrets,
-      "aws_auth" => @principal.granted_aws_auth_secrets,
-      "oauth_token" => @principal.granted_oauth_token_secrets,
-      "pg_dsn" => @principal.granted_pg_dsn_secrets,
-      "hmac" => @principal.granted_hmac_secrets
-    }
     effective_page = PrincipalEffectiveGrantsPage.new(
       principal: @principal,
-      relations: effective_grant_relations,
+      relations: @principal.granted_secrets_by_kind,
       page: params[:effective_grants_page],
       per_page: PRINCIPAL_DETAIL_PER_PAGE
     ).call
@@ -161,6 +152,20 @@ class ConsoleController < ApplicationController
   def oauth_app
     @oauth_app = OauthApp.find_by_oid!(params[:id])
     @minted_credentials = @oauth_app.broker_credentials.order(created_at: :asc, id: :asc)
+    @provider_details = {}
+    @provider_credential = @minted_credentials.first if @oauth_app.shared?
+    provider = @oauth_app.provider_strategy
+    if provider.respond_to?(:details_for) && @provider_credential && !@provider_credential.dead? &&
+        @provider_credential.access_token.present? && (@provider_credential.expires_at.nil? || @provider_credential.expires_at.future?)
+      begin
+        @provider_details = provider.details_for(@provider_credential,
+          http_client: HttpClient.new(open_timeout: 2, read_timeout: 2, write_timeout: 2, max_body_bytes: 128 * 1024))
+        @provider_details = {} unless @provider_details.is_a?(Hash)
+      rescue StandardError
+        # Optional provider details must never prevent credential management.
+        @provider_details = {}
+      end
+    end
   end
 
   # Where a secret's value is resolved from, as a list of segments. Each segment

@@ -1,5 +1,6 @@
 import { createSlackbotV2, type SlackbotV2Options } from './index'
 import { parseChannelDefaults } from './channel-defaults'
+import { isHarnessEnabled, parseEnabledHarnesses } from './overrides'
 import { resolveSlackHomeTeamId } from './session-api'
 import { resolveSlackBotUserId } from './slack-user'
 import {
@@ -13,6 +14,11 @@ const botToken = requiredEnv('SLACK_BOT_TOKEN')
 const signingSecret = requiredEnv('SLACK_SIGNING_SECRET')
 const slackApiUrl = optionalEnv('SLACK_API_URL')
 const slackApiTimeoutMs = optionalNumberEnv('SLACKBOTV2_SLACK_API_TIMEOUT_MS')
+const enabledHarnesses = parseEnabledHarnesses(process.env.SLACKBOTV2_ENABLED_HARNESSES)
+const defaultHarnessType = stringEnv('SLACKBOTV2_DEFAULT_HARNESS', 'codex')
+if (!isHarnessEnabled(defaultHarnessType, enabledHarnesses)) {
+  throw new Error('SLACKBOTV2_DEFAULT_HARNESS must be enabled in SLACKBOTV2_ENABLED_HARNESSES')
+}
 const botUserId = await resolveSlackBotUserId({
   botToken,
   configuredBotUserId: optionalEnv('SLACK_BOT_USER_ID'),
@@ -56,14 +62,10 @@ const options: SlackbotV2Options = {
   channelDefaults: parseChannelDefaults(optionalEnv('SLACKBOTV2_CHANNEL_DEFAULTS'), reason =>
     consoleLogger.warn('slackbotv2 SLACKBOTV2_CHANNEL_DEFAULTS', { reason })
   ),
-  codexNanocodexRolloutPercent: percentEnv(
-    'SLACKBOTV2_CODEX_NANOCODEX_ROLLOUT_PERCENT',
-    0
-  ),
-  consolePublicUrl: optionalEnv('CENTAUR_CONSOLE_PUBLIC_URL'),
   responseMetadataMode: responseMetadataModeEnv('SLACKBOTV2_RESPONSE_METADATA_MODE'),
   responseServiceTierEnabled: booleanEnv('SLACKBOTV2_RESPONSE_SERVICE_TIER_ENABLED', false),
-  defaultHarnessType: optionalEnv('SLACKBOTV2_DEFAULT_HARNESS'),
+  defaultHarnessType,
+  enabledHarnesses,
   // Same env vars deployers use to override the sandbox harness model
   // (sandbox.extraEnv); the chart mirrors them here so displayed defaults
   // track the deployment instead of the baked harness config.
@@ -71,7 +73,9 @@ const options: SlackbotV2Options = {
     ...(optionalEnv('CLAUDE_MODEL') ? { claudecode: optionalEnv('CLAUDE_MODEL')! } : {}),
     ...(optionalEnv('CODEX_MODEL')
       ? { codex: optionalEnv('CODEX_MODEL')!, nanocodex: optionalEnv('CODEX_MODEL')! }
-      : {})
+      : {}),
+    ...(optionalEnv('CENTAUR_PI_MODEL') ? { pi: optionalEnv('CENTAUR_PI_MODEL')! } : {}),
+    ...(optionalEnv('CENTAUR_OMP_MODEL') ? { omp: optionalEnv('CENTAUR_OMP_MODEL')! } : {})
   },
   harnessDefaultReasoning: optionalEnv('CODEX_MODEL_REASONING_EFFORT')
     ? {
@@ -104,7 +108,7 @@ const options: SlackbotV2Options = {
 }
 options.slackHomeTeamId = await resolveSlackHomeTeamId(options)
 
-const { app } = createSlackbotV2(options)
+const { app, drain } = createSlackbotV2(options)
 const server = Bun.serve({
   port,
   fetch: app.fetch
@@ -120,6 +124,7 @@ console.log(
     activity_summary_status_enabled: options.activitySummaryStatusEnabled,
     auto_join_created_channels_enabled: options.autoJoinCreatedChannels,
     message_overrides_strategy: messageOverridesStrategyMode,
+    enabled_harnesses: enabledHarnesses,
     message_overrides_strategy_enabled:
       messageOverridesStrategyMode !== 'llm' || Boolean(messageOverridesStrategyApiKey),
     response_metadata_mode: options.responseMetadataMode,
@@ -130,6 +135,29 @@ console.log(
     api_url: apiUrl
   })
 )
+
+// Kubernetes removes a terminating pod from its Service while SIGTERM is
+// delivered, so keep accepting requests for a moment before draining.
+const SHUTDOWN_LINGER_MS = 5_000
+// How long SIGTERM then waits for in-flight replies; linger plus drain stays
+// under the pod's termination grace period (30s by default). A reply still
+// running then is recovered by the next process from its render obligation.
+const shutdownDrainMs = numberEnv('SLACKBOTV2_SHUTDOWN_DRAIN_MS', 20_000)
+let shuttingDown = false
+const shutdown = async (signal: string): Promise<void> => {
+  if (shuttingDown) return
+  shuttingDown = true
+  log('info', 'slackbotv2_shutdown_started', { signal, drain_ms: shutdownDrainMs })
+  await new Promise(resolve => setTimeout(resolve, SHUTDOWN_LINGER_MS))
+  const unfinished = await drain(shutdownDrainMs)
+  // Lets requests still in progress send their responses.
+  await server.stop()
+  log('info', 'slackbotv2_shutdown_complete', { signal, unfinished })
+  process.exit(0)
+}
+// As PID 1 the process would otherwise ignore SIGTERM until the kubelet's SIGKILL.
+process.on('SIGTERM', () => void shutdown('SIGTERM'))
+process.on('SIGINT', () => void shutdown('SIGINT'))
 
 function optionalEnv(name: string): string | undefined {
   const value = process.env[name]?.trim()
@@ -172,16 +200,6 @@ function responseMetadataModeEnv(name: string): 'first' | 'always' | 'never' {
   if (!value) return 'first'
   if (value === 'first' || value === 'always' || value === 'never') return value
   throw new Error(`${name} must be "first", "always", or "never"`)
-}
-
-function percentEnv(name: string, fallback: number): number {
-  const value = optionalEnv(name)
-  if (!value) return fallback
-  const parsed = Number(value)
-  if (!Number.isInteger(parsed) || parsed < 0 || parsed > 100) {
-    throw new Error(`${name} must be an integer from 0 to 100`)
-  }
-  return parsed
 }
 
 function createMessageOverridesStrategy(): SlackbotV2Options['messageOverridesStrategy'] {

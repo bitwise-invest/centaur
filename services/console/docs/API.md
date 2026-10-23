@@ -1,6 +1,6 @@
 # iron-control API
 
-`iron-control` exposes a JSON API under `/api/v1`. Resource endpoints require API key authentication. `POST /api/v1/proxy/sync` uses proxy bearer authentication, and sandbox read endpoints use the sandbox entitlement JWT injected by `iron-proxy`.
+`iron-control` exposes a JSON API under `/api/v1`. Resource endpoints require API key authentication, and sandbox read endpoints use the sandbox entitlement JWT injected by `iron-proxy`.
 
 - [Authentication](#authentication)
 - [Conventions](#conventions)
@@ -40,7 +40,7 @@ A missing or invalid token returns `401`:
 { "error": { "message": "invalid or missing API key" } }
 ```
 
-`iron-proxy` instances authenticate to [`POST /api/v1/proxy/sync`](#proxy-sync) with their own token (`iprx_` followed by 64 lowercase hex characters), issued once when the proxy is created. An invalid proxy token returns `401` with `"invalid or missing proxy token"`.
+`iron-proxy` instances authenticate to [proxy sync](#proxy-sync), served by the separate `proxy-sync` service, with their own token (`iprx_` followed by 64 lowercase hex characters), issued once when the proxy is created. An invalid proxy token returns `401` with `"invalid or missing proxy token"`.
 
 Sandbox skill catalog endpoints use the existing sandbox entitlement JWT injected by `iron-proxy`.
 
@@ -1009,6 +1009,7 @@ Google and Slack are supported providers in this release. The `provider` field i
 | `client_secret`        | required on create | OAuth client secret. Write-only and encrypted at rest; on update it is only changed when supplied. Never returned. |
 | `allowed_scopes`       | required    | Non-empty array of scope strings the start endpoint requests. A flow's optional `scopes` param must be a subset; omitting it requests all of these. |
 | `enabled`              | optional    | Defaults to `true`. A disabled app rejects new consent flows; existing credentials keep refreshing. |
+| `shared`               | optional    | Defaults to `false`. One admin-connected account with role-granted access. Create-only; changes return `422`. Incompatible with `always_available`. |
 
 The `client_secret` is required and write-only: it is accepted on writes but never returned in any response.
 
@@ -1062,7 +1063,7 @@ Returns `201`. The `client_secret` is never echoed back:
 
 `GET /api/v1/sandbox/oauth_apps`
 
-Returns enabled OAuth apps and the console URLs a sandbox user can open to start consent. Authenticate with the same sandbox entitlement JWT as `GET /api/v1/sandbox/permissions`. The token signature, issuer, audience, and expiry are verified. Proxy and principal claims are not checked because these URLs are not sensitive.
+Returns enabled non-shared OAuth apps and the console URLs a sandbox user can open to start consent. Authenticate with the same sandbox entitlement JWT as `GET /api/v1/sandbox/permissions`. The token signature, issuer, audience, and expiry are verified. Proxy and principal claims are not checked because these URLs are not sensitive.
 
 ```json
 {
@@ -1105,6 +1106,33 @@ The sandbox permissions response includes an `oauth_credentials` array with non-
   }
 }
 ```
+
+### Sandbox Admin Permission Management
+
+An active admin Console user's Slack DM sandbox may create Slack channel, Slack user, and workflow principals, create and edit static and Postgres DSN secrets whose sources reference an external store, inspect a principal's effective grants, manage its roles, direct secret grants, Slack channel permissions, and sandbox capabilities, and edit the Slack Connect allowlist with its sandbox entitlement JWT. The sandbox principal must be a `slack_dm` principal linked to that admin whose Slack team is the bot's workspace, as recorded by the Slack channel catalog. Other sandboxes, including channel, Slack Connect, and Console-user sessions, receive `403`. Request and response shapes match the corresponding admin endpoints.
+
+| Method | Path | Notes |
+| ------ | ---- | ----- |
+| `GET` | `/api/v1/sandbox/admin/principals` | List principals. `slack_channel_id=<id>` returns only principals bound to that channel. |
+| `GET` | `/api/v1/sandbox/admin/principals/:id` | Fetch one by OID. |
+| `POST` | `/api/v1/sandbox/admin/principals` | Create a Slack channel (`data: { kind: "slack_channel", slack_channel_id }`), Slack user (`data: { kind: "slack_dm", slack_user_id }`), or workflow (`data: { kind: "workflow", workflow_name }`) principal. The foreign ID, kind, and Slack fields match what api-rs derives: `slack-channel-<channel>`, `slack-user-<team>-<user>` in the admin's workspace, or `workflow-<slugged workflow_name>` for `WORKFLOW_PRINCIPAL = True`. A new channel principal gets full Slack access to its own channel. Other kinds and DM channel IDs return `400`; invalid IDs and existing principals return `422`. |
+| `GET` | `/api/v1/sandbox/admin/principals/lookup/:foreign_id` | Fetch one by foreign ID. |
+| `GET`/`POST` | `/api/v1/sandbox/admin/static_secrets[/:id]`, `/api/v1/sandbox/admin/pg_dsn_secrets[/:id]` | Fetch a secret by OID or create one, as in the static and Postgres DSN secret APIs. Inline `control_plane` and OAuth `token_broker` sources return `403`. |
+| `PATCH`/`PUT` | `/api/v1/sandbox/admin/static_secrets/:id`, `/api/v1/sandbox/admin/pg_dsn_secrets/:id` | Update an existing secret by OID. Omitted fields, including the source, keep their current values. Same source restrictions; secrets with a `token_broker` source return `403`. |
+| `GET`/`POST` | `/api/v1/sandbox/admin/principals/:principal_id/roles` | List or assign roles (`data: { role_id }`). |
+| `DELETE` | `/api/v1/sandbox/admin/principals/:principal_id/roles/:id` | Unassign a role. |
+| `GET` | `/api/v1/sandbox/admin/roles`, `/roles/:id`, `/roles/lookup/:foreign_id` | List or fetch roles. |
+| `GET` | `/api/v1/sandbox/admin/principals/:principal_id/grants` | List a principal's direct grants. |
+| `GET` | `/api/v1/sandbox/admin/principals/:id/effective_grants` | List secrets the principal holds directly or through roles, paginated with `page` and `limit`. Each row has `id`, `grant_key`, `foreign_id`, `name`, `direct`, and `roles` (`id`, `foreign_id`, `name`) that grant it. |
+| `POST` | `/api/v1/sandbox/admin/grants` | Grant a secret to a principal (`data: { principal_id, <grant_key>: <secret oid> }`). Role grants return `403`. |
+| `DELETE` | `/api/v1/sandbox/admin/grants/:id` | Revoke a direct principal grant. Role grants return `404`. |
+| `GET` | `/api/v1/sandbox/admin/secrets` | List grantable secrets of every kind with `id`, `grant_key`, `foreign_id`, `name`, `description`, and `labels`. `q` filters by name or foreign ID. |
+| `POST` | `/api/v1/sandbox/admin/principals/:id/slack_channel_permissions` | Upsert one Slack channel permission (`data: { channel_id, upload_enabled, download_enabled, history_enabled }`). New permissions default omitted flags to `true`. |
+| `DELETE` | `/api/v1/sandbox/admin/principals/:id/slack_channel_permissions/:channel_id` | Remove the principal's own permission for a channel. |
+| `PATCH` | `/api/v1/sandbox/admin/principals/:id/sandbox_access` | Update only the supplied `sandbox_repo_cache` and `sandbox_*_enabled` fields. Flags must be JSON booleans; other values return `400`. |
+| `GET` | `/api/v1/sandbox/admin/slack_external_teams` | List allowed Slack Connect workspace (`T…`) and Enterprise Grid org (`E…`) ids as `data: [id, …]`. The list is stored by api-rs; if it is unreachable the request returns `503`. |
+| `POST` | `/api/v1/sandbox/admin/slack_external_teams` | Allow one id (`data: { team_id }`) and return the updated list. Adding an allowed id changes nothing. Invalid ids return `422`. |
+| `DELETE` | `/api/v1/sandbox/admin/slack_external_teams/:id` | Remove one id and return the updated list. Returns `404` if the id is not allowed. |
 
 ## OAuth consent flow
 
@@ -1473,8 +1501,8 @@ These endpoints use the existing sandbox entitlement JWT injected by `iron-proxy
 | `GET` | `/api/v1/sandbox/skills` | List visible skills. Optional `scope=private|shared` and `limit` up to 20. |
 | `GET` | `/api/v1/sandbox/skills/search?q=...` | Full-text search visible skills. |
 | `GET` | `/api/v1/sandbox/skills/:id` | Read a visible skill by its exact name or `skl_...` OID. |
-| `POST` | `/api/v1/sandbox/skills` | Create a public skill from `data.name`, `data.description`, and `data.instructions`. |
-| `PUT`/`PATCH` | `/api/v1/sandbox/skills/:id` | Update an owned or editable skill using those fields; optional `data.lock_version` detects concurrent edits. |
+| `POST` | `/api/v1/sandbox/skills` | Create a skill from `data.name`, `data.description`, and `data.instructions`. Optional `data.visibility` (`private` or `shared`) defaults to `shared`. |
+| `PUT`/`PATCH` | `/api/v1/sandbox/skills/:id` | Update an owned or editable skill using name, description, and instructions (not visibility); optional `data.lock_version` detects concurrent edits. |
 | `DELETE` | `/api/v1/sandbox/skills/:id` | Archive an owned skill. |
 | `POST` | `/api/v1/sandbox/skills/:id/share` | Make an owned skill public. |
 | `POST` | `/api/v1/sandbox/skills/:id/unshare` | Make an owned skill private. |
@@ -1554,6 +1582,8 @@ Deleting a principal does not delete its proxies: they become unassigned and can
 ## Proxy sync
 
 `POST /api/v1/proxy/sync`
+
+This endpoint is served by the separate `proxy-sync` service (`services/proxy-sync`), which reads iron-control's database directly; iron-control itself does not route it. The payload is documented here because it is assembled from the resources above.
 
 Called by `iron-proxy` instances to fetch their configuration. **Authentication is the proxy bearer token** (`Authorization: Bearer iprx_...`), not an API key.
 
