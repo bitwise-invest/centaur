@@ -29,7 +29,7 @@ module Oauth
     FLOW_COOKIE = :oauth_flow
 
     # Tests replace the token-exchange and identity-lookup clients with HTTP
-    # doubles, mirroring BrokerCredential#refresh_client.
+    # doubles.
     class_attribute :exchange_client_factory, default: -> { Broker::AuthorizationCodeClient.new }
     class_attribute :identity_http_client_factory, default: -> { HttpClient.new }
 
@@ -162,8 +162,15 @@ module Oauth
         redirect_uri: oauth_callback_redirect_uri(@app.slug),
         code_verifier: code_verifier.to_s,
         require_refresh_token: provider_requires_refresh_token?,
-        client_auth_method: provider_token_endpoint_auth_method
+        client_auth_method: provider_token_endpoint_auth_method,
+        extra_params: provider_extra_token_params
       )
+    end
+
+    def provider_extra_token_params
+      return @provider.extra_token_params if @provider.respond_to?(:extra_token_params)
+
+      {}
     end
 
     def provider_token_endpoint_auth_method

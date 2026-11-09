@@ -2,6 +2,20 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
   "definitions": {
+    "slackbotv2ProactivityRules": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {
+        "type": "object",
+        "required": ["name", "when"],
+        "properties": {
+          "name": { "type": "string", "pattern": "\\S" },
+          "when": { "type": "string", "pattern": "\\S" },
+          "context": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    },
     "podScheduling": {
       "type": "object",
       "properties": {
@@ -220,7 +234,44 @@
               "name": { "type": "string", "minLength": 1 },
               "baseUrl": { "type": "string", "pattern": "^https://" },
               "apiKeyEnv": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]*$" },
-              "defaultModel": { "type": "string", "minLength": 1 }
+              "defaultModel": { "type": "string", "minLength": 1 },
+              "models": {
+                "type": "object",
+                "propertyNames": { "pattern": "\\S" },
+                "additionalProperties": {
+                  "type": "object",
+                  "properties": {
+                    "displayName": { "type": "string", "pattern": "\\S" },
+                    "aliases": {
+                      "type": "array",
+                      "items": { "type": "string", "pattern": "\\S" },
+                      "uniqueItems": true
+                    },
+                    "description": { "type": "string", "pattern": "\\S" },
+                    "contextWindow": { "type": "integer", "minimum": 1 },
+                    "inputModalities": {
+                      "type": "array",
+                      "items": { "type": "string", "enum": ["text", "image"] },
+                      "minItems": 1,
+                      "uniqueItems": true,
+                      "contains": { "const": "text" }
+                    },
+                    "reasoningEfforts": {
+                      "type": "array",
+                      "items": { "type": "string", "enum": ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] },
+                      "uniqueItems": true
+                    },
+                    "defaultReasoning": { "type": "string", "enum": ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] },
+                    "reasoningAliases": {
+                      "type": "object",
+                      "propertyNames": { "pattern": "\\S" },
+                      "additionalProperties": { "type": "string", "enum": ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] }
+                    }
+                  },
+                  "required": ["displayName"],
+                  "additionalProperties": false
+                }
+              }
             },
             "required": ["name", "baseUrl", "apiKeyEnv"],
             "additionalProperties": false
@@ -232,6 +283,8 @@
       "type": "object",
       "properties": {
         "nodeSelector": { "type": "object" },
+        "hostUsers": { "type": ["boolean", "null"] },
+        "containerSecurityContext": { "type": "object" },
         "tolerations": { "type": "array" },
         "runtimeClassName": { "type": "string" },
         "serviceAccountName": { "type": "string" },
@@ -240,7 +293,8 @@
         "telemetry": {
           "type": "object",
           "properties": {
-            "captureTranscripts": { "type": "boolean" }
+            "captureTranscripts": { "type": "boolean" },
+            "captureToolTraces": { "type": "boolean" }
           }
         }
       }
@@ -407,6 +461,22 @@
           "enum": ["automatic", "preapproved"]
         },
         "sandboxRunningLimit": { "type": "integer", "minimum": 0 },
+        "sandboxWarmPools": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["harness", "repoCache", "size"],
+            "properties": {
+              "harness": {
+                "type": "string",
+                "enum": ["codex", "amp", "claudecode", "nanocodex", "hermes", "pi", "omp"]
+              },
+              "repoCache": { "type": "string", "enum": ["all", "public", "none"] },
+              "size": { "type": "integer", "minimum": 0 }
+            }
+          }
+        },
         "sessionEventsRetentionDays": { "type": "integer", "minimum": 0, "maximum": 3650 },
         "sessionEventsRetentionSweepIntervalSecs": { "type": "integer", "minimum": 1 },
         "sandboxOrphanSweepGraceSecs": { "type": "integer", "minimum": 1 },
@@ -525,6 +595,46 @@
           "enum": ["first", "always", "never"]
         },
         "responseServiceTierEnabled": { "type": "boolean" },
+        "generativeUi": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "limits": {
+              "type": "object",
+              "properties": {
+                "tables": { "type": "integer", "minimum": 1 },
+                "charts": { "type": "integer", "minimum": 1 },
+                "fields": { "type": "integer", "minimum": 1 },
+                "tableRows": { "type": "integer", "minimum": 1 },
+                "tableColumns": { "type": "integer", "minimum": 1 },
+                "chartLabel": { "type": "integer", "minimum": 1 },
+                "chartTitle": { "type": "integer", "minimum": 1 },
+                "chartSeries": { "type": "integer", "minimum": 1 },
+                "chartPoints": { "type": "integer", "minimum": 1 }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        },
+        "proactivity": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "classifier": { "type": "string", "minLength": 1 },
+            "model": { "type": "string", "minLength": 1 },
+            "openaiBaseUrl": { "type": "string" },
+            "timeoutMs": { "type": "integer", "minimum": 1 },
+            "debounceMs": { "type": "integer", "minimum": 0 },
+            "defaultRules": { "$ref": "#/definitions/slackbotv2ProactivityRules" },
+            "channelRules": {
+              "type": "object",
+              "propertyNames": { "pattern": "^[A-Z0-9]+$" },
+              "additionalProperties": { "$ref": "#/definitions/slackbotv2ProactivityRules" }
+            }
+          },
+          "additionalProperties": false
+        },
         "metrics": {
           "type": "object",
           "properties": {
@@ -546,6 +656,17 @@
       "type": "object",
       "properties": {
         "cidrs": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "podSelector": {
+          "type": "object",
+          "propertyNames": {
+            "pattern": "^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?[A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$"
+          },
+          "additionalProperties": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$"
+          }
+        },
+        "namespace": { "type": "string", "pattern": "^([a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)?$" },
         "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
         "textSearch": { "enum": ["", "paradedb", "postgres"] }
       }

@@ -549,7 +549,9 @@ export async function forwardToSessionApi(
       input.reasoning,
       input.provider,
       input.metadataModel,
-      input.metadataHarnessType
+      input.metadataHarnessType,
+      input.proactiveContext,
+      input.generativeUiNote
     ),
     sessionApiTimeoutMs(options),
     'execute session'
@@ -569,6 +571,8 @@ export const WORKFLOW_ACTION_PREFIX = 'centaur.workflow.action:'
 export const SESSION_STEERING_DELIVERED_EVENT = 'session.steering_delivered'
 /** Emitted by api-rs when a follow-up could not reach the still-running execution. */
 export const SESSION_STEERING_FAILED_EVENT = 'session.steering_failed'
+/** Emitted by api-rs while a long execution is still running. */
+export const SESSION_PROGRESS_UPDATE_EVENT = 'session.progress_update'
 
 export async function dispatchSlackBlockAction(
   options: SlackbotV2Options,
@@ -1392,7 +1396,9 @@ async function executeSession(
   reasoning?: string,
   provider?: string,
   metadataModel?: string,
-  metadataHarnessType?: string
+  metadataHarnessType?: string,
+  proactiveContext?: string,
+  generativeUiNote?: string
 ): Promise<SlackbotV2ExecuteSessionResponse> {
   const fetchFn = options.fetch ?? fetch
   const requesterIdentity = await resolveRequesterIdentity(options, message)
@@ -1424,7 +1430,9 @@ async function executeSession(
       contextMessages,
       contextPreamble,
       reasoning,
-      provider
+      provider,
+      proactiveContext,
+      generativeUiNote
     ),
     idle_timeout_ms: idleTimeoutMs,
     ...(options.maxDurationMs === undefined ? {} : { max_duration_ms: options.maxDurationMs })
@@ -1654,7 +1662,9 @@ function toCodexInputLines(
   contextMessages?: SlackbotV2ApiMessage[],
   contextPreamble?: string,
   reasoning?: string,
-  provider?: string
+  provider?: string,
+  proactiveContext?: string,
+  generativeUiNote?: string
 ): string[] {
   const staged = new Map<SlackbotV2ApiAttachment, string>()
   const lines: string[] = []
@@ -1670,7 +1680,9 @@ function toCodexInputLines(
       contextMessages,
       contextPreamble,
       reasoning,
-      provider
+      provider,
+      proactiveContext,
+      generativeUiNote
     )
     if (
       inlineLine.length <= MAX_CODEX_INPUT_LINE_CHARS
@@ -1693,7 +1705,9 @@ function toCodexInputLines(
       contextMessages,
       contextPreamble,
       reasoning,
-      provider
+      provider,
+      proactiveContext,
+      generativeUiNote
     )
   )
   return lines
@@ -1722,7 +1736,9 @@ function toCodexInputLineWithStaged(
   contextMessages?: SlackbotV2ApiMessage[],
   contextPreamble?: string,
   reasoning?: string,
-  provider?: string
+  provider?: string,
+  proactiveContext?: string,
+  generativeUiNote?: string
 ): string {
   return JSON.stringify({
     type: 'user',
@@ -1738,7 +1754,9 @@ function toCodexInputLineWithStaged(
         staged,
         requesterIdentity,
         contextMessages,
-        contextPreamble
+        contextPreamble,
+        proactiveContext,
+        generativeUiNote
       )
     }
   })
@@ -1839,7 +1857,9 @@ function codexInputContent(
   staged: Map<SlackbotV2ApiAttachment, string> = new Map(),
   requesterIdentity?: RequesterIdentity,
   contextMessages?: SlackbotV2ApiMessage[],
-  contextPreamble?: string
+  contextPreamble?: string,
+  proactiveContext?: string,
+  generativeUiNote?: string
 ): JsonValue[] {
   const content: JsonValue[] = []
   const slackSessionContext = slackUploadSessionContext(message.threadId)
@@ -1868,6 +1888,12 @@ function codexInputContent(
     content.push(
       codexAttachmentInput(contextAttachment.attachment, staged.get(contextAttachment.attachment))
     )
+  }
+  if (proactiveContext?.trim()) {
+    content.push({ type: 'text', text: proactiveContext })
+  }
+  if (generativeUiNote) {
+    content.push({ type: 'text', text: generativeUiNote })
   }
   const promptText = slackMessagePromptText(message)
   if (promptText.trim()) {
@@ -2048,6 +2074,7 @@ async function* parseSessionEventStream(
     // Slack hides when a follow-up message lands in the thread.
     if (
       event.event === 'session.activity_summary' ||
+      event.event === SESSION_PROGRESS_UPDATE_EVENT ||
       event.event === SESSION_STEERING_DELIVERED_EVENT ||
       event.event === SESSION_STEERING_FAILED_EVENT
     ) {
@@ -2070,7 +2097,7 @@ async function* parseSessionEventStream(
     }
     if (event.event === 'session.execution_cancelled') {
       yield {
-        data: { error: sessionErrorMessage(event, 'Execution interrupted') },
+        data: { error: sessionErrorMessage(event, 'Execution interrupted.') },
         event: event.event,
         eventId: event.id,
         eventKind: event.event

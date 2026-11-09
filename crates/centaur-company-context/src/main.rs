@@ -3,6 +3,7 @@ mod calendar_tasks;
 mod config;
 mod credentials;
 mod custom_documents;
+mod custom_documents_api;
 mod database;
 mod drive;
 mod embeddings;
@@ -119,6 +120,7 @@ async fn main() -> Result<()> {
         credentials: credentials.clone(),
         embeddings: embeddings.clone(),
         jwt: Arc::new(query::JwtVerifier::new(&config)),
+        custom_projection: config.custom_enabled.then(|| absurd.clone()),
     };
     let slack = SlackClient::new(&config)?;
     tasks::register(TaskState {
@@ -152,6 +154,7 @@ async fn main() -> Result<()> {
                 .iter()
                 .map(|(id, days)| (id.clone(), chrono::Duration::days(*days as i64)))
                 .collect(),
+            thread_refresh: chrono::Duration::days(config.slack_thread_refresh_days as i64),
             bot_token: config.slack_bot_token.clone(),
         },
     )?;
@@ -166,6 +169,7 @@ async fn main() -> Result<()> {
         .route("/readyz", get(ready))
         .route("/metrics", get(render_metrics))
         .with_state(http_state)
+        .merge(custom_documents_api::router(query_state.clone()))
         .merge(query::router(query_state));
     let listener = tokio::net::TcpListener::bind(config.bind_addr).await?;
 
