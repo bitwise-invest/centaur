@@ -1,8 +1,7 @@
 name: Pull request audit
 
 on:
-  pull_request:
-    types: [labeled]
+  workflow_dispatch:
 
 permissions: {}
 

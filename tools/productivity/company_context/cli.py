@@ -8,7 +8,6 @@ from typing import Any
 import typer
 from dotenv import load_dotenv
 from rich.console import Console
-from rich.json import JSON
 from rich.table import Table
 
 from .client import CompanyContextClient
@@ -24,14 +23,17 @@ app = typer.Typer(
         "`centaur-skills` before use.\n\n"
         "Preview: `company_context v2 search|read` query Slack messages and files, "
         "Google Docs and PDFs, Google Calendar events, Granola notes, and custom "
-        "documents through the company-context service's API, where it is deployed."
+        "documents through the company-context service's API, where it is deployed; "
+        "`company_context v2 create|update|delete|list` manage the custom "
+        "documents, such as memories, that you create."
     ),
 )
 v2_app = typer.Typer(
     help=(
         "Preview: query Slack messages and files, Google Docs and PDFs, Google Calendar "
-        "events, Granola notes, and custom documents visible to the current user "
-        "through the company-context service's API."
+        "events, Granola notes, and custom documents visible to the current user, "
+        "and manage the custom documents the current user creates, through the "
+        "company-context service's API."
     ),
 )
 app.add_typer(v2_app, name="v2")
@@ -63,7 +65,8 @@ console = Console()
 
 
 def _print_json(data: dict[str, Any]) -> None:
-    console.print(JSON(json.dumps(data, default=str)))
+    # Plain print: Rich wraps long lines, which splits JSON strings and escapes.
+    print(json.dumps(data, indent=2, ensure_ascii=False, default=str))
 
 
 def _require_ok(result: dict[str, Any]) -> None:
@@ -441,6 +444,17 @@ def v2_search(
             """e.g. '{"author": "Ada"}'. Matches exactly and case-sensitively."""
         ),
     ),
+    keyword: bool = typer.Option(
+        False,
+        "--keyword",
+        help=(
+            "Return every document containing all query terms, newest first and unranked, "
+            "instead of ranking by relevance. Page with --cursor to enumerate history."
+        ),
+    ),
+    cursor: str | None = typer.Option(
+        None, "--cursor", help="next_cursor from the previous --keyword page."
+    ),
     json_output: bool = typer.Option(
         True,
         "--json/--table",
@@ -458,6 +472,8 @@ def v2_search(
         file_ids=file_ids,
         sources=sources,
         metadata=metadata,
+        keyword=keyword,
+        cursor=cursor,
     )
     _require_ok(result)
     if json_output:
@@ -482,6 +498,8 @@ def v2_search(
             " ".join(str(item.get("text") or "").split())[:200],
         )
     console.print(table)
+    if result.get("next_cursor"):
+        console.print(f"Next page: --cursor '{result['next_cursor']}'")
 
 
 @v2_app.command("read")
@@ -503,6 +521,89 @@ def v2_read(
     if result.get("url"):
         console.print(f"[dim]{result['url']}[/dim]")
     console.print(result.get("text") or "")
+
+
+_SOURCE_HELP = "Custom document source, e.g. memory."
+_READERS_HELP = (
+    "Who can read the document; repeat for several: public, principal:<your ID>, or "
+    "role:<one of your roles>. Defaults to you alone."
+)
+
+
+@v2_app.command("create")
+def v2_create(
+    source: str = typer.Argument(..., help=_SOURCE_HELP),
+    body: str = typer.Argument(..., help="Document text."),
+    title: str | None = typer.Option(None, "--title", help="Document title."),
+    occurred_at: str | None = typer.Option(
+        None, "--occurred-at", help="RFC 3339 time the content occurred, for time filters."
+    ),
+    readers: list[str] | None = typer.Option(None, "--reader", help=_READERS_HELP),  # noqa: B008
+    metadata: str | None = typer.Option(
+        None, "--metadata", callback=_json_object, help="JSON object returned with the document."
+    ),
+) -> None:
+    """Create a custom document in a source; prints it with its new external_id."""
+    result = CompanyContextV2Client().create_document(
+        source, body, title=title, occurred_at=occurred_at, readers=readers, metadata=metadata
+    )
+    _require_ok(result)
+    _print_json(result)
+
+
+@v2_app.command("update")
+def v2_update(
+    source: str = typer.Argument(..., help=_SOURCE_HELP),
+    external_id: str = typer.Argument(..., help="Document ID returned by v2 create."),
+    body: str = typer.Argument(..., help="New document text."),
+    title: str | None = typer.Option(None, "--title", help="Document title."),
+    occurred_at: str | None = typer.Option(
+        None, "--occurred-at", help="RFC 3339 time the content occurred, for time filters."
+    ),
+    readers: list[str] | None = typer.Option(None, "--reader", help=_READERS_HELP),  # noqa: B008
+    metadata: str | None = typer.Option(
+        None, "--metadata", callback=_json_object, help="JSON object returned with the document."
+    ),
+) -> None:
+    """Replace a custom document you created; omitted options are cleared or reset."""
+    result = CompanyContextV2Client().update_document(
+        source,
+        external_id,
+        body,
+        title=title,
+        occurred_at=occurred_at,
+        readers=readers,
+        metadata=metadata,
+    )
+    _require_ok(result)
+    _print_json(result)
+
+
+@v2_app.command("delete")
+def v2_delete(
+    source: str = typer.Argument(..., help=_SOURCE_HELP),
+    external_id: str = typer.Argument(..., help="Document ID returned by v2 create."),
+) -> None:
+    """Delete a custom document you created."""
+    result = CompanyContextV2Client().delete_document(source, external_id)
+    _require_ok(result)
+    _print_json(result)
+
+
+@v2_app.command("list")
+def v2_list(
+    source: str = typer.Argument(..., help=_SOURCE_HELP),
+    limit: int | None = typer.Option(
+        None, "--limit", "-n", help="Max documents (API default 20, at most 100)."
+    ),
+    before: str | None = typer.Option(
+        None, "--before", help="Only documents created before this external_id, to page."
+    ),
+) -> None:
+    """List the custom documents you created in a source, newest first."""
+    result = CompanyContextV2Client().list_documents(source, limit=limit, before=before)
+    _require_ok(result)
+    _print_json(result)
 
 
 if __name__ == "__main__":
