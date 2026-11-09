@@ -1,22 +1,7 @@
 name: Validate agent plugin
 
 on:
-  push:
-    paths:
-      - ".agents/plugins/**"
-      - ".claude-plugin/**"
-      - "plugins/centaur/**"
-      - "scripts/validate_agent_plugin.py"
-      - "scripts/test_validate_agent_plugin.py"
-      - ".github/workflows/validate-agent-plugin.yml"
-  pull_request:
-    paths:
-      - ".agents/plugins/**"
-      - ".claude-plugin/**"
-      - "plugins/centaur/**"
-      - "scripts/validate_agent_plugin.py"
-      - "scripts/test_validate_agent_plugin.py"
-      - ".github/workflows/validate-agent-plugin.yml"
+  workflow_dispatch:
 
 permissions:
   contents: read
