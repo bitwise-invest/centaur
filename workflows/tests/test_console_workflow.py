@@ -259,6 +259,120 @@ def test_handler_posts_long_dm_results_as_replies_to_the_first_message():
     assert len(context.slack_calls) == 3
 
 
+@pytest.mark.parametrize(
+    "details", ["Supply 10; repayment 2; withdrawal 4; borrowing 3.", "x" * 9_000]
+)
+def test_handler_posts_only_summary_at_root_and_all_details_in_thread(details):
+    summary = "*Liquidity-layer report — November 11, 2026*\nWindow: November 11 → November 12 UTC."
+    context = FakeContext(
+        result_text=f"{summary}\n\n{console_workflow.SLACK_THREAD_SEPARATOR}\n\n{details}"
+    )
+    params = {
+        "prompt": "Post title and window to the channel, details in a thread",
+        "principal": "console-user-author",
+        "channel": "C0123456789",
+        "slack_user_id": "U0123456789",
+        "scheduled_task_id": "tsk_123",
+    }
+
+    result = asyncio.run(console_workflow.handler(params, context))
+    asyncio.run(console_workflow.handler(params, context))
+
+    assert context.slack_calls[0] == ("C0123456789", summary, slack_args(0))
+    footer = "Sent by <@U0123456789>'s scheduled task"
+    assert (
+        "".join(call[1] for call in context.slack_calls[1:]) == f"{details}\n\n{footer}"
+    )
+    assert len(result["delivery"]["replies"]) == len(context.slack_calls) - 1
+    for index, call in enumerate(context.slack_calls[1:], start=1):
+        assert call[0] == "C0123456789"
+        assert call[2]["thread_ts"] == "123.1"
+        assert call[2]["client_msg_id"] == slack_args(index)["client_msg_id"]
+        assert len(call[1]) <= console_workflow.SLACK_MESSAGE_CHUNK_MAX_LENGTH
+    assert "blocks" in context.slack_calls[-1][2]
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        "<!-- SLACK_THREAD -->\nDetails",
+        "Summary\n<!-- SLACK_THREAD -->",
+        "Summary\n<!-- SLACK_THREAD -->\nDetails\n<!-- SLACK_THREAD -->\nMore",
+        "x" * 3_801 + "\n<!-- SLACK_THREAD -->\nDetails",
+    ],
+)
+def test_handler_rejects_invalid_thread_split_before_posting(response):
+    context = FakeContext(result_text=response)
+    with pytest.raises(ValueError, match="Slack threaded delivery"):
+        asyncio.run(
+            console_workflow.handler(
+                {
+                    "prompt": "Report in a thread",
+                    "principal": "console-user-author",
+                    "channel": "C0123456789",
+                    "scheduled_task_id": "tsk_123",
+                },
+                context,
+            )
+        )
+    assert context.slack_calls == []
+
+
+def test_threaded_delivery_resumes_after_reply_failure_without_reposting_summary():
+    class ReplyFailureContext(FakeContext):
+        failed = False
+
+        async def post_to_slack(self, channel, text, **kwargs):
+            if kwargs.get("thread_ts") and not self.failed:
+                self.failed = True
+                raise RuntimeError("Temporary Slack failure")
+            return await super().post_to_slack(channel, text, **kwargs)
+
+    context = ReplyFailureContext(
+        result_text="Title\nWindow\n<!-- SLACK_THREAD -->\nFull report"
+    )
+    params = {
+        "prompt": "Report in a thread",
+        "principal": "console-user-author",
+        "channel": "C0123456789",
+        "scheduled_task_id": "tsk_123",
+    }
+    with pytest.raises(RuntimeError, match="Temporary Slack failure"):
+        asyncio.run(console_workflow.handler(params, context))
+    asyncio.run(console_workflow.handler(params, context))
+
+    assert len(context.agent_calls) == 1
+    assert len(context.slack_calls) == 2
+    assert context.slack_calls[0][1] == "Title\nWindow"
+    assert context.slack_calls[1][2]["thread_ts"] == "123.1"
+    assert context.slack_calls[1][2]["client_msg_id"] == "task-456:slack:6"
+
+
+def test_delivery_chunks_accept_crlf_and_keep_details_out_of_full_size_summary():
+    summary = "x" * console_workflow.SLACK_MESSAGE_CHUNK_MAX_LENGTH
+    chunks = console_workflow._delivery_chunks(
+        f"{summary}\r\n<!-- SLACK_THREAD -->\r\nDetails", 49_000
+    )
+    assert chunks == [summary, "Details"]
+
+
+def test_delivery_chunks_preserve_inline_marker_as_plain_text():
+    response = "The marker <!-- SLACK_THREAD --> must be on its own line."
+    assert console_workflow._delivery_chunks(response, 49_000) == [response]
+
+
+def test_delivery_chunks_limit_total_summary_and_details_length():
+    chunks = console_workflow._delivery_chunks(
+        "Summary\n<!-- SLACK_THREAD -->\n" + "x" * 60_000, 49_000
+    )
+    assert chunks[0] == "Summary"
+    assert len("".join(chunks)) == 49_000
+    assert all(
+        len(chunk) <= console_workflow.SLACK_MESSAGE_CHUNK_MAX_LENGTH
+        for chunk in chunks
+    )
+
+
 def test_handler_delivers_canonical_result_text_instead_of_output_lines():
     body = (
         "Cold scoops kiss the cone\n"

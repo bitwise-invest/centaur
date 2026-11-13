@@ -26,10 +26,17 @@ If the task asks you to stay silent when there is nothing to report and there is
 # narrate what they checked before the token, so only the ending is matched.
 SKIP_DELIVERY_TOKEN = "NO_UPDATE"
 SKIP_DELIVERY_PATTERN = re.compile(rf"(?:^|\s)[`*_]*{SKIP_DELIVERY_TOKEN}[`*_.]*$")
+SLACK_THREAD_SEPARATOR = "<!-- SLACK_THREAD -->"
+SLACK_THREAD_SEPARATOR_PATTERN = re.compile(
+    rf"^{re.escape(SLACK_THREAD_SEPARATOR)}[ \t]*\r?$", re.MULTILINE
+)
 SLACK_MRKDWN_INSTRUCTIONS = """\
 Format the final response for Slack using Slack mrkdwn, not standard Markdown.
 Use *bold*, _italics_, ~strikethrough~, `inline code`, and <https://example.com|link text>.
 Use bold text instead of Markdown headings and lists instead of Markdown tables.
+If the task requests a short channel summary with details in a thread, return the summary first,
+then <!-- SLACK_THREAD --> on its own line, then the complete thread details.
+Keep the summary under 3,800 characters and both parts nonempty. Do not include the separator otherwise.
 Return only the message that should be posted to Slack."""
 
 
@@ -51,7 +58,7 @@ async def _deliver_to_slack(
     footer = _scheduled_task_footer(slack_user_id)
     footer_suffix = f"\n\n{footer}"
     body_limit = SLACK_MESSAGE_MAX_LENGTH - len(footer_suffix)
-    chunks = _split_slack_text(text[:body_limit], SLACK_MESSAGE_CHUNK_MAX_LENGTH)
+    chunks = _delivery_chunks(text, body_limit)
     final_body = chunks[-1]
     if len(final_body) + len(footer_suffix) <= SLACK_MESSAGE_CHUNK_MAX_LENGTH:
         chunks[-1] = f"{final_body}{footer_suffix}"
@@ -96,6 +103,25 @@ async def _deliver_to_slack(
         )
         replies.append(reply)
     return {**root, "replies": replies}
+
+
+def _delivery_chunks(text: str, body_limit: int) -> list[str]:
+    parts = SLACK_THREAD_SEPARATOR_PATTERN.split(text)
+    if len(parts) == 1:
+        return _split_slack_text(text[:body_limit], SLACK_MESSAGE_CHUNK_MAX_LENGTH)
+    if len(parts) != 2:
+        raise ValueError("Slack threaded delivery requires exactly one separator")
+    summary, details = (part.strip() for part in parts)
+    if not summary or not details:
+        raise ValueError("Slack threaded delivery requires a summary and details")
+    if len(summary) > SLACK_MESSAGE_CHUNK_MAX_LENGTH:
+        raise ValueError("Slack threaded delivery summary exceeds the message limit")
+    return [
+        summary,
+        *_split_slack_text(
+            details[: body_limit - len(summary)], SLACK_MESSAGE_CHUNK_MAX_LENGTH
+        ),
+    ]
 
 
 def _scheduled_task_footer(slack_user_id: str) -> str:

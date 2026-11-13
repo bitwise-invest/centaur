@@ -30,6 +30,17 @@ container. Workflow-host sandboxes receive the same ordered list translated to
 `/home/agent/github/...`. Files in those directories are loaded the same way as
 built-in workflows; sources without the directory are skipped.
 
+## Threaded scheduled-task reports
+
+Console scheduled tasks can request a short channel announcement with the full
+report in a reply thread. Ask for the title and reporting window in the summary,
+followed by `<!-- SLACK_THREAD -->` on its own line and then the detailed report.
+The delivery workflow removes this separator, posts only the summary at the
+channel root, and posts every detail chunk as a reply to that message. The task
+footer appears only on the final reply. Both parts must be nonempty and the
+summary must fit within 3,800 characters; malformed splits fail before posting.
+Responses without the separator retain their existing delivery behavior.
+
 ## Define a workflow
 
 Each workflow file exports `WORKFLOW_NAME` and an async `handler(params, ctx)`.
